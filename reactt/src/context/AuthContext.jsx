@@ -1,7 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import {
+  browserLocalPersistence,
   createUserWithEmailAndPassword,
   onAuthStateChanged,
+  setPersistence,
   signInWithEmailAndPassword,
   signOut,
   updateProfile,
@@ -12,10 +14,6 @@ import { auth, db, isFirebaseReady } from '../services/firebase.js'
 const AuthContext = createContext(null)
 
 async function saveUserProfile(user, extras = {}) {
-  if (!db) {
-    return null
-  }
-
   const profile = {
     uid: user.uid,
     email: user.email ?? extras.email ?? '',
@@ -25,7 +23,16 @@ async function saveUserProfile(user, extras = {}) {
     ...extras,
   }
 
-  await setDoc(doc(db, 'users', user.uid), profile, { merge: true })
+  if (!db) {
+    return profile
+  }
+
+  try {
+    await setDoc(doc(db, 'users', user.uid), profile, { merge: true })
+  } catch {
+    // Keep auth usable even if profile sync fails.
+  }
+
   return profile
 }
 
@@ -40,29 +47,55 @@ export function AuthProvider({ children }) {
       return undefined
     }
 
-    const unsubscribe = onAuthStateChanged(auth, async (nextUser) => {
-      if (!nextUser) {
-        setUser(null)
-        setProfile(null)
-        setLoading(false)
+    let active = true
+    let unsubscribe
+
+    const initializeAuth = async () => {
+      try {
+        await setPersistence(auth, browserLocalPersistence)
+      } catch {
+        // Continue with default persistence if setting local persistence fails.
+      }
+
+      if (!active) {
         return
       }
 
-      const savedProfile = await saveUserProfile(nextUser, {
-        email: nextUser.email ?? '',
-        displayName: nextUser.displayName ?? '',
+      unsubscribe = onAuthStateChanged(auth, async (nextUser) => {
+        if (!nextUser) {
+          setUser(null)
+          setProfile(null)
+          setLoading(false)
+          return
+        }
+
+        const savedProfile = await saveUserProfile(nextUser, {
+          email: nextUser.email ?? '',
+          displayName: nextUser.displayName ?? '',
+        })
+
+        if (!active) {
+          return
+        }
+
+        setUser(nextUser)
+        setProfile(savedProfile)
+        setLoading(false)
       })
+    }
 
-      setUser(nextUser)
-      setProfile(savedProfile)
-      setLoading(false)
-    })
+    initializeAuth()
 
-    return unsubscribe
+    return () => {
+      active = false
+      if (unsubscribe) {
+        unsubscribe()
+      }
+    }
   }, [])
 
   const signup = useCallback(async ({ name, email, password }) => {
-    if (!auth || !db) {
+    if (!auth) {
       throw new Error('Firebase is not configured. Add the VITE_FIREBASE_* environment variables.')
     }
 
@@ -84,7 +117,7 @@ export function AuthProvider({ children }) {
   }, [])
 
   const login = useCallback(async ({ email, password }) => {
-    if (!auth || !db) {
+    if (!auth) {
       throw new Error('Firebase is not configured. Add the VITE_FIREBASE_* environment variables.')
     }
 

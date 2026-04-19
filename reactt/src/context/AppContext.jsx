@@ -14,6 +14,39 @@ const defaultState = {
   topicBatch: 1,
 }
 
+function getProgressCacheKey(uid) {
+  return `devtrack-progress-${uid}`
+}
+
+function readProgressFromCache(uid) {
+  if (!uid || typeof window === 'undefined') {
+    return null
+  }
+
+  try {
+    const raw = window.localStorage.getItem(getProgressCacheKey(uid))
+    if (!raw) {
+      return null
+    }
+
+    return normalizeProgress(JSON.parse(raw))
+  } catch {
+    return null
+  }
+}
+
+function writeProgressToCache(uid, progress) {
+  if (!uid || typeof window === 'undefined') {
+    return
+  }
+
+  try {
+    window.localStorage.setItem(getProgressCacheKey(uid), JSON.stringify(progress))
+  } catch {
+    // Ignore cache write failures.
+  }
+}
+
 function normalizeProgress(data) {
   const understoodTopicIds = Array.isArray(data?.understoodTopicIds) ? data.understoodTopicIds : []
   const completedTaskIds = Array.isArray(data?.completedTaskIds) ? data.completedTaskIds : []
@@ -85,7 +118,7 @@ export function AppProvider({ children }) {
     let active = true
 
     async function loadProgress() {
-      if (!user || !db) {
+      if (!user) {
         setState(defaultState)
         setHydrated(true)
         return
@@ -93,13 +126,40 @@ export function AppProvider({ children }) {
 
       setHydrated(false)
 
-      const snapshot = await getDoc(doc(db, 'progress', user.uid))
+      const cachedProgress = readProgressFromCache(user.uid)
+
+      if (!db) {
+        setState(cachedProgress ?? defaultState)
+        setHydrated(true)
+        return
+      }
+
+      try {
+        const snapshot = await getDoc(doc(db, 'progress', user.uid))
+
+        if (!active) {
+          return
+        }
+
+        if (snapshot.exists()) {
+          const normalized = normalizeProgress(snapshot.data())
+          setState(normalized)
+          writeProgressToCache(user.uid, normalized)
+        } else {
+          setState(cachedProgress ?? defaultState)
+        }
+      } catch {
+        if (!active) {
+          return
+        }
+
+        setState(cachedProgress ?? defaultState)
+      }
 
       if (!active) {
         return
       }
 
-      setState(snapshot.exists() ? normalizeProgress(snapshot.data()) : defaultState)
       setHydrated(true)
     }
 
@@ -111,19 +171,23 @@ export function AppProvider({ children }) {
   }, [user])
 
   useEffect(() => {
-    if (!user || !db || !hydrated) {
+    if (!user || !hydrated) {
       return undefined
     }
 
     const timeoutId = window.setTimeout(() => {
-      setDoc(
-        doc(db, 'progress', user.uid),
-        {
-          ...state,
-          updatedAt: Date.now(),
-        },
-        { merge: true },
-      )
+      const payload = {
+        ...state,
+        updatedAt: Date.now(),
+      }
+
+      writeProgressToCache(user.uid, payload)
+
+      if (db) {
+        setDoc(doc(db, 'progress', user.uid), payload, { merge: true }).catch(() => {
+          // Cache already has the latest progress when remote sync fails.
+        })
+      }
     }, 250)
 
     return () => {
